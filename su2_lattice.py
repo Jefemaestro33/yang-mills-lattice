@@ -277,6 +277,59 @@ class GaugeField:
                 O = O + xp.sum(pf, axis=(1, 2, 3))   # sum over spatial
         return O
 
+    def smeared_spatial_plaquette_timeslice(self, n_smear=20, alpha=0.5):
+        """
+        0++ glueball operator built from APE-smeared spatial links.
+
+        APE smearing: iteratively replace each spatial link U_i(x) with
+            U_i' = Proj_SU2[(1-α)U_i + (α/4) Σ_{j≠i,spatial} staple_j]
+        Only spatial links (i=1,2,3) are smeared; temporal links untouched.
+        This dramatically improves overlap with the glueball ground state.
+
+        Parameters
+        ----------
+        n_smear : int   — number of smearing iterations (default 20)
+        alpha   : float — smearing fraction (default 0.5)
+        """
+        # Work on a COPY of spatial links — don't modify the gauge field
+        U_sm = [None, self.U[1].copy(), self.U[2].copy(), self.U[3].copy()]
+
+        for _ in range(n_smear):
+            U_new = [None, None, None, None]
+            for i in range(1, 4):
+                staple = xp.zeros_like(U_sm[i])
+                for j in range(1, 4):
+                    if j == i:
+                        continue
+                    # upper spatial staple: U_j(x+î) · U_i†(x+ĵ) · U_j†(x)
+                    upper = qmul(qmul(
+                        self._shift(U_sm[j], i, fwd=True),
+                        qdagger(self._shift(U_sm[i], j, fwd=True))),
+                        qdagger(U_sm[j]))
+                    # lower spatial staple: U_j†(x+î-ĵ) · U_i†(x-ĵ) · U_j(x-ĵ)
+                    lower = qmul(qmul(
+                        qdagger(self._shift(
+                            self._shift(U_sm[j], i, fwd=True), j, fwd=False)),
+                        qdagger(self._shift(U_sm[i], j, fwd=False))),
+                        self._shift(U_sm[j], j, fwd=False))
+                    staple = staple + upper + lower
+                # Blend and project back to SU(2)
+                blended = (1.0 - alpha) * U_sm[i] + (alpha / 4.0) * staple
+                U_new[i] = qnormalize(blended)
+            U_sm[1], U_sm[2], U_sm[3] = U_new[1], U_new[2], U_new[3]
+
+        # Measure spatial plaquettes with smeared links
+        Nt = self.dims[0]
+        O = xp.zeros(Nt)
+        for mu in range(1, 4):
+            for nu in range(mu + 1, 4):
+                P = qmul(
+                    qmul(U_sm[mu], self._shift(U_sm[nu], mu, fwd=True)),
+                    qmul(qdagger(self._shift(U_sm[mu], nu, fwd=True)),
+                         qdagger(U_sm[nu])))
+                O = O + xp.sum(P[..., 0], axis=(1, 2, 3))
+        return O
+
     def topological_charge(self):
         """
         Naive lattice topological charge (clover definition).
