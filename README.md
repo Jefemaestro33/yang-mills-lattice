@@ -241,39 +241,33 @@ Cada fase valida la anterior antes de gastar más. Se puede parar en cualquier p
 
 **Criterio para avanzar:** Plaqueta promedio correcta Y decaimiento exponencial visible en el correlador.
 
-#### Fase 1 — $15–20 (Google Cloud, A100 spot instance ~$1/hora)
+#### Fase 1 — $20–25 (Google Cloud, T4 spot instance)
 
-**Objetivo:** Medir la gluebola estándar y buscar dependencia topológica en el correlador.
+**Objetivo:** Extraer la masa del glueball 0⁺⁺ y buscar dependencia topológica en el correlador.
+
+**Recalibración basada en datos de Fase 0:** Con 500 configs y un solo operador, el S/N en τ=2 es 0.9. Escalar por fuerza bruta (S/N ∝ √N) requiere ~2000 configs para S/N ≈ 2 en τ=2, o ~20,000 para τ=3 — prohibitivo. La solución es GEVP.
 
 | Parámetro | Valor |
 |---|---|
 | Lattice | 24³ × 48 |
 | Grupo | SU(2) |
 | β | 2.5 |
-| Configuraciones | 500 |
+| Configuraciones | 500–1000 |
 | Decorrelación | 200 sweeps |
-| Implementación | CuPy en A100 |
-| Tiempo estimado | ~15 horas de GPU (~$15) |
+| Operadores | 4 (smearing a 0, 5, 10, 20 iters, α=0.3) |
+| Método | GEVP para proyectar al ground state desde τ=1 |
+| Implementación | CuPy en T4 |
+| Costo estimado | ~$20–25 |
 
 **Qué se mide:**
 
-1. **Masa del 0⁺⁺ con operadores estándar.** Debe dar ~1.5–1.7 GeV al convertir a unidades físicas. Este es el segundo checkpoint: reproducir el resultado conocido.
+1. **Masa del 0⁺⁺ vía GEVP.** Construir la matriz de correladores 4×4 con operadores a distintos niveles de smearing. El GEVP proyecta al ground state desde τ=1, convirtiendo el S/N de 7.9 en τ=1 en una medida útil. Debe dar ~1.5–1.7 GeV.
 2. **Carga topológica Q por configuración.** Usando gradient flow para definir la densidad topológica. Se obtiene la distribución P(Q) y la susceptibilidad χ_t = ⟨Q²⟩/V.
-3. **Correlador por bin topológico.** Separar las 500 configuraciones en bins según |Q| (ej: Q = 0, |Q| = 1, |Q| ≥ 2). Medir el correlador de gluebola en cada bin por separado. Comparar las masas efectivas.
+3. **Correlador por bin topológico.** Separar las configuraciones en bins según |Q| (ej: Q=0, |Q|=1, |Q|≥2). Medir el correlador en cada bin por separado.
 
-**El dato interesante de esta fase:** ¿La masa efectiva del 0⁺⁺ depende de |Q|? Si la masa no cambia con Q, no hay señal topológica y probablemente la búsqueda termina aquí — resultado nulo limpio. Si cambia, hay algo que investigar y se justifica la Fase 2.
+**El dato interesante de esta fase:** ¿La masa efectiva del 0⁺⁺ depende de |Q|? Si no cambia con Q, no hay señal topológica y la búsqueda termina — resultado nulo limpio. Si cambia, se justifica la Fase 2.
 
 **Criterio para avanzar:** Masa del 0⁺⁺ en el rango correcto (~1.6 GeV) Y dependencia estadísticamente significativa de la masa o el correlador con |Q|.
-
-### Fase 1 — Recalibration based on Phase 0 data
-
-Phase 0 data shows S/N = 0.9 at τ = 2 with 500 configs. Brute-force scaling (S/N ∝ √N) requires ~2000 configs for S/N ≈ 2 at τ = 2, or ~20,000 for τ = 3 — prohibitive.
-
-**New approach: GEVP with multi-smearing operator basis.**
-
-Construct 4 operators at smearing levels 0, 5, 10, 20 iterations (α = 0.3). The GEVP projects onto the ground state starting from τ = 1, converting the existing S/N = 7.9 at τ = 1 into a useful ground state mass measurement. With 500–1000 configs and GEVP, the 0⁺⁺ mass should be extractable.
-
-**Updated cost estimate:** $20–25 on T4 spot (4 operators per config instead of 1, but configuration generation unchanged).
 
 #### Fase 2 — $30–50 (solo si Fase 1 muestra algo)
 
@@ -310,62 +304,59 @@ Se escala a 48³ × 96, tres o más valores de β para extrapolación al continu
 
 ---
 
-## Part VI — Phase 0 Implementation and Validation
+## Parte VI — Implementación y validación de Fase 0
 
-### What was implemented
+### Qué se implementó
 
-Three files comprise the Phase 0 codebase:
+- **`su2_lattice.py`** — Motor de simulación. Operaciones SU(2) vectorizadas en representación de cuaterniones. Heat-bath Kennedy-Pendleton con actualización checkerboard. Acción de Wilson. Correlador de glueball 0⁺⁺ con sustracción de VEV. Smearing APE de links espaciales.
+- **`run_phase0.py`** — Script de Fase 0: termalización, medición, guardado de datos.
+- **`analysis.py`** — Análisis post-simulación: estadísticas de plaqueta, masa efectiva, errores jackknife.
 
-- **`su2_lattice.py`** — Core simulation engine. Vectorized SU(2) quaternion operations (multiply, dagger, trace, random group element). Kennedy-Pendleton heat-bath algorithm with checkerboard update (even/odd sublattice decomposition for parallelism). Wilson gauge action computation. 0++ glueball correlator with disconnected part subtraction.
-- **`run_phase0.py`** — Driver script. Manages thermalization, measurement sweeps, and data output.
-- **`analysis.py`** — Post-simulation analysis. Plaquette statistics, effective mass extraction, jackknife error estimation.
+### Bugs del roadmap y cómo se corrigieron
 
-### Bugs from the roadmap and how each was fixed
+**Bug 1 — Factor de 2 en el exponente del heat-bath.** El código original usaba `lambda_val = 0.5 * beta * k`. El peso de Boltzmann correcto para SU(2) es exp(β·k·a₀), no exp(β·k·a₀/2). Corregido usando `beta * k` completo.
 
-**Bug 1 — Factor of 2 in the heat-bath exponent.** The original code used `lambda_val = 0.5 * beta * k` in the acceptance step. The correct Boltzmann weight for SU(2) is exp(beta * k * a0), not exp(beta * k * a0 / 2). Fixed by using the full `beta * k` without the factor of 0.5 in the Kennedy-Pendleton sampling.
+**Bug 2 — Falta la medida de Haar.** La distribución para a₀ debe incluir el factor √(1−a₀²), que es la medida de Haar de SU(2). Corregido implementando el algoritmo Kennedy-Pendleton completo con accept/reject que incluye el factor √(1−a₀²).
 
-**Bug 2 — Missing Haar measure.** The distribution for the quaternion parameter a0 must include the factor sqrt(1 - a0^2), which is the Haar measure of SU(2) coming from integrating the 3-vector directions over S^2. Fixed by implementing the full Kennedy-Pendleton algorithm, which generates a0 from the distribution P(a0) proportional to sqrt(1 - a0^2) * exp(beta * k * a0) via the accept/reject step with the sqrt factor.
+**Bug 3 — Acoplamiento anisotrópico.** En la Fase 0 isotrópica (ξ=1) no aplica. El código maneja el caso general correctamente.
 
-**Bug 3 — Anisotropic coupling incorrect.** A spatial link participates in both spatial plaquettes (with beta_s) and temporal plaquettes (with beta_t). The original code applied beta_s uniformly to all staples. Fixed by computing spatial and temporal staples separately and weighting each with the correct coupling. For the isotropic Phase 0 runs (xi = 1), this reduces to uniform beta, but the code now handles the general case correctly.
+**Bug 4 — Parte desconectada del correlador.** El correlador se calculaba como C(t) = ⟨O(t)O(0)⟩ sin sustraer ⟨O⟩². Para Tr F², el VEV es no nulo. Corregido: C(t) = ⟨O(t)O(0)⟩ − ⟨O⟩².
 
-**Bug 4 — Disconnected part of the correlator.** The correlator was computed as C(t) = <O(t)O(0)> without subtracting <O>^2. For Tr F^2, the VEV is nonzero. Fixed by subtracting the disconnected part: C_conn(t) = <O(t)O(0)> - <O>^2, so the effective mass at large t reflects exponential decay rather than a constant offset.
+### Resultados de validación
 
-### Validation results
+Todas las corridas de validación en lattices 8³×16 salvo donde se indique.
 
-All validation runs performed on 8^3 x 16 lattices unless otherwise noted.
+**Verificación del staple.** Se calculó el cambio en la acción de Wilson por una actualización de un solo link de dos formas: (1) predicho por la suma de staples, (2) recálculo directo de todas las plaquetas afectadas. Diferencia: 1.46×10⁻¹³ (precisión de máquina).
 
-**Staple verification.** Computed the change in Wilson action from a single-link update two ways: (1) predicted from the staple sum, (2) direct recomputation of all affected plaquettes. Agreement: Delta S predicted vs direct = 1.46e-13 (machine precision).
+**Distribución del heat-bath.** Se generaron muestras del algoritmo Kennedy-Pendleton a varios valores de α = β·k y se comparó ⟨a₀⟩ medido contra el valor teórico ⟨a₀⟩ = I₂(α)/I₁(α):
 
-**Heat-bath distribution.** Generated 10^6 samples from the Kennedy-Pendleton algorithm at various values of alpha = beta * k and compared the measured mean <a0> against the theoretical expectation <a0> = I_2(2*alpha)/I_1(2*alpha) (ratio of modified Bessel functions):
+| α | ⟨a₀⟩ medido | ⟨a₀⟩ teórico (I₂/I₁) | Δ |
+|---|---|---|---|
+| 5 | 0.71922 | 0.71934 | -0.00012 |
+| 10 | 0.85405 | 0.85419 | -0.00014 |
+| 15 | 0.90177 | 0.90179 | -0.00001 |
+| 20 | 0.92625 | 0.92599 | +0.00026 |
 
-| alpha | Measured <a0> | Theoretical <a0> |
-|---|---|---|
-| 1.0 | 0.6975 | 0.6978 |
-| 2.0 | 0.8381 | 0.8383 |
-| 4.0 | 0.9160 | 0.9161 |
-| 8.0 | 0.9573 | 0.9574 |
+**Convergencia hot/cold a β=2.5, 8³×16.** Tanto el arranque caliente (configuración aleatoria) como el frío (todos los links = identidad) convergen al mismo valor de equilibrio de la plaqueta después de ~50 sweeps, confirmando balance detallado y ergodicidad.
 
-**Hot/Cold convergence at beta = 2.5, 8^3 x 16.** Both hot start (random configuration) and cold start (all links = identity) converge to the same equilibrium plaquette value after thermalization (~200 sweeps), confirming detailed balance and ergodicity of the heat-bath algorithm.
+**Scan de plaqueta.** Plaqueta promedio como función de β en dos tamaños de lattice (300 sweeps termalización + 100 mediciones × 10 sweeps):
 
-**Plaquette scan.** Mean plaquette as a function of beta on 8^3 x 16 lattice:
+| β | ⟨P⟩ (8³×16) | err | ⟨P⟩ (12³×24) | err |
+|---|---|---|---|---|
+| 1.5 | 0.36251 | 0.00022 | 0.36246 | 0.00010 |
+| 2.0 | 0.50084 | 0.00030 | 0.50111 | 0.00012 |
+| 2.2 | 0.56925 | 0.00025 | 0.56919 | 0.00010 |
+| 2.5 | 0.65198 | 0.00019 | 0.65203 | 0.00009 |
+| 2.7 | 0.68548 | 0.00019 | 0.68560 | 0.00007 |
+| 3.0 | 0.72305 | 0.00014 | 0.72321 | 0.00007 |
 
-| beta | Mean plaquette |
-|---|---|
-| 1.5 | 0.4892 |
-| 2.0 | 0.5984 |
-| 2.2 | 0.6273 |
-| 2.5 | 0.6539 |
-| 2.7 | 0.6874 |
-| 3.0 | 0.7217 |
-| 4.0 | 0.7894 |
+**Verificación cold start.** Desde un arranque frío con todos los links U = I: plaqueta = 1.0 exacto, y la suma de staples para cualquier link = 6·I (seis plaquetas contribuyentes, cada una I). Confirma la geometría correcta del cálculo del staple.
 
-**Cold start verification.** From an ordered (cold) start with all links U = I: plaquette = 1.0 exactly, and the staple sum for any link equals 6 * I (six contributing plaquettes, each contributing I), confirming correct geometry of the staple calculation.
+### Resultados finales de Fase 0 (500 configs, T4 GPU on-demand, 137 min)
 
-### Phase 0 Final Results (500 configs, T4 GPU on-demand, 137 min)
+**Plaqueta:** ⟨P⟩ = 0.651969 ± 0.000041. τ_int = 0.7 configs (configuraciones independientes con 50 sweeps de separación). Consistente con los scans de validación (0.65198 en 8³×16, 0.65203 en 12³×24). **Cerrado.**
 
-**Plaquette:** ⟨P⟩ = 0.651969 ± 0.000041. τ_int = 0.7 configs (configurations are independent at 50-sweep separation). Consistent with smoke test (0.65198 on 8³×16) and literature. Code samples from the correct distribution. **Closed.**
-
-**Correlator (unsmeared):**
+**Correlador (unsmeared):**
 
 | τ | C(τ) | err | S/N | m_eff | m_err |
 |---|---|---|---|---|---|
@@ -373,11 +364,11 @@ All validation runs performed on 8^3 x 16 lattices unless otherwise noted.
 | 1 | 46.1 | 5.8 | 7.9 | 2.27 | 1.16 |
 | 2 | 4.7 | 5.5 | 0.9 | — | — |
 
-m_eff(0) ≈ 2.57 lattice units ≈ 3.0 GeV. Dominated by excited states — not the ground state. The 0⁺⁺ ground state (~1.6 GeV, m·a ≈ 0.65) would dominate at τ ≥ 3–4, where there is no signal. This is standard behavior.
+m_eff(0) ≈ 2.57 unidades del lattice ≈ 3.0 GeV. Dominado por estados excitados — no es el ground state. El ground state 0⁺⁺ (~1.6 GeV, m·a ≈ 0.65) dominaría en τ ≥ 3–4, donde no hay señal. Comportamiento estándar.
 
-**Smearing diagnostic:** 30 iterations with α=0.5 destroyed the signal (S/N dropped from 7.9 to 0.1 at τ=1). Smearing radius ~4 lattice sites ≈ 1/3 of spatial volume — too aggressive. Optimal: 5–10 iterations, α=0.2–0.3.
+**Diagnóstico de smearing:** 30 iteraciones con α=0.5 destruyó la señal (S/N cayó de 7.9 a 0.1 en τ=1). Radio de smearing ~4 sitios ≈ 1/3 del volumen espacial — demasiado agresivo. Óptimo: 5–10 iteraciones, α=0.2–0.3.
 
-**Verdict:** Plaquette ✓. Code validated ✓. Correlator shows exponential decay ✓. Ground state mass not extractable at this statistics — requires GEVP (Phase 1).
+**Veredicto:** Plaqueta ✓. Código validado ✓. Correlador muestra decaimiento exponencial ✓. Masa del ground state no extraíble con esta estadística — requiere GEVP (Fase 1).
 
 ---
 
