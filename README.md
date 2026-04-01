@@ -366,7 +366,7 @@ Todas las corridas de validación en lattices 8³×16 salvo donde se indique.
 
 m_eff(0) ≈ 2.57 unidades del lattice ≈ 3.0 GeV. Dominado por estados excitados — no es el ground state. El ground state 0⁺⁺ (~1.6 GeV, m·a ≈ 0.65) dominaría en τ ≥ 3–4, donde no hay señal. Comportamiento estándar.
 
-**Diagnóstico de smearing:** 30 iteraciones con α=0.5 destruyó la señal (S/N cayó de 7.9 a 0.1 en τ=1). Radio de smearing ~4 sitios ≈ 1/3 del volumen espacial — demasiado agresivo. Óptimo: 5–10 iteraciones, α=0.2–0.3.
+**Diagnóstico de smearing:** 30 iteraciones con α=0.5 no solo destruyó la señal sino que produjo un correlador físicamente no interpretable: C(1) = −0.6 (negativo) seguido de C(2) = 9.2 (positivo). Un correlador conectado no puede oscilar de signo en los primeros timeslices — esto indica que el smearing agresivo introdujo artefactos. Radio de smearing ~4 sitios ≈ 1/3 del volumen espacial. Estos datos smeared no deben usarse para extraer física. Óptimo para Fase 1: 5–10 iteraciones, α=0.2–0.3.
 
 **Veredicto:** Plaqueta ✓. Código validado ✓. Correlador muestra decaimiento exponencial ✓. Masa del ground state no extraíble con esta estadística — requiere GEVP (Fase 1).
 
