@@ -265,6 +265,16 @@ Cada fase valida la anterior antes de gastar más. Se puede parar en cualquier p
 
 **Criterio para avanzar:** Masa del 0⁺⁺ en el rango correcto (~1.6 GeV) Y dependencia estadísticamente significativa de la masa o el correlador con |Q|.
 
+### Fase 1 — Recalibration based on Phase 0 data
+
+Phase 0 data shows S/N = 0.9 at τ = 2 with 500 configs. Brute-force scaling (S/N ∝ √N) requires ~2000 configs for S/N ≈ 2 at τ = 2, or ~20,000 for τ = 3 — prohibitive.
+
+**New approach: GEVP with multi-smearing operator basis.**
+
+Construct 4 operators at smearing levels 0, 5, 10, 20 iterations (α = 0.3). The GEVP projects onto the ground state starting from τ = 1, converting the existing S/N = 7.9 at τ = 1 into a useful ground state mass measurement. With 500–1000 configs and GEVP, the 0⁺⁺ mass should be extractable.
+
+**Updated cost estimate:** $20–25 on T4 spot (4 operators per config instead of 1, but configuration generation unchanged).
+
 #### Fase 2 — $30–50 (solo si Fase 1 muestra algo)
 
 **Objetivo:** Explorar θ ≠ 0 y base extendida de operadores.
@@ -350,6 +360,24 @@ All validation runs performed on 8^3 x 16 lattices unless otherwise noted.
 | 4.0 | 0.7894 |
 
 **Cold start verification.** From an ordered (cold) start with all links U = I: plaquette = 1.0 exactly, and the staple sum for any link equals 6 * I (six contributing plaquettes, each contributing I), confirming correct geometry of the staple calculation.
+
+### Phase 0 Final Results (500 configs, T4 GPU on-demand, 137 min)
+
+**Plaquette:** ⟨P⟩ = 0.651969 ± 0.000041. τ_int = 0.7 configs (configurations are independent at 50-sweep separation). Consistent with smoke test (0.65198 on 8³×16) and literature. Code samples from the correct distribution. **Closed.**
+
+**Correlator (unsmeared):**
+
+| τ | C(τ) | err | S/N | m_eff | m_err |
+|---|---|---|---|---|---|
+| 0 | 604.4 | 7.2 | 83.9 | 2.57 | 0.13 |
+| 1 | 46.1 | 5.8 | 7.9 | 2.27 | 1.16 |
+| 2 | 4.7 | 5.5 | 0.9 | — | — |
+
+m_eff(0) ≈ 2.57 lattice units ≈ 3.0 GeV. Dominated by excited states — not the ground state. The 0⁺⁺ ground state (~1.6 GeV, m·a ≈ 0.65) would dominate at τ ≥ 3–4, where there is no signal. This is standard behavior.
+
+**Smearing diagnostic:** 30 iterations with α=0.5 destroyed the signal (S/N dropped from 7.9 to 0.1 at τ=1). Smearing radius ~4 lattice sites ≈ 1/3 of spatial volume — too aggressive. Optimal: 5–10 iterations, α=0.2–0.3.
+
+**Verdict:** Plaquette ✓. Code validated ✓. Correlator shows exponential decay ✓. Ground state mass not extractable at this statistics — requires GEVP (Phase 1).
 
 ---
 
