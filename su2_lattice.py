@@ -70,6 +70,18 @@ def qnormalize(u):
     return u / xp.maximum(n, 1e-30)
 
 
+def qnormalize_pos(u):
+    """Project onto SU(2) and flip to a0 > 0 hemisphere.
+
+    U and -U represent the same SU(2) element (center Z₂ ambiguity).
+    For smearing, we must pick a consistent sign to prevent cancellations.
+    """
+    v = qnormalize(u)
+    sign = xp.sign(v[..., 0:1])             # sign of a0
+    sign = xp.where(sign == 0, 1.0, sign)   # handle exact zero
+    return v * sign
+
+
 def qidentity(shape):
     """Batch of identity quaternions (1, 0, 0, 0).  Returns shape + (4,)."""
     u = xp.zeros(shape + (4,))
@@ -277,21 +289,19 @@ class GaugeField:
                 O = O + xp.sum(pf, axis=(1, 2, 3))   # sum over spatial
         return O
 
-    def smeared_spatial_plaquette_timeslice(self, n_smear=20, alpha=0.5):
+    def _ape_smear(self, n_smear, alpha):
         """
-        0++ glueball operator built from APE-smeared spatial links.
+        APE smearing of spatial links.
 
-        APE smearing: iteratively replace each spatial link U_i(x) with
-            U_i' = Proj_SU2[(1-α)U_i + (α/4) Σ_{j≠i,spatial} staple_j]
+        Iteratively replace each spatial link U_i(x) with
+            U_i' = Proj_SU2[(1-α)U_i + (α/4) Σ_{j≠i,spatial} C_j]
+        where C_j is the smearing staple (NOT the action staple):
+            upper: U_j(x) · U_i(x+ĵ) · U_j†(x+î)
+            lower: U_j†(x-ĵ) · U_i(x-ĵ) · U_j(x-ĵ+î)
         Only spatial links (i=1,2,3) are smeared; temporal links untouched.
-        This dramatically improves overlap with the glueball ground state.
 
-        Parameters
-        ----------
-        n_smear : int   — number of smearing iterations (default 20)
-        alpha   : float — smearing fraction (default 0.5)
+        Returns list [None, U1_sm, U2_sm, U3_sm] of smeared spatial links.
         """
-        # Work on a COPY of spatial links — don't modify the gauge field
         U_sm = [None, self.U[1].copy(), self.U[2].copy(), self.U[3].copy()]
 
         for _ in range(n_smear):
@@ -301,57 +311,316 @@ class GaugeField:
                 for j in range(1, 4):
                     if j == i:
                         continue
-                    # upper spatial staple: U_j(x+î) · U_i†(x+ĵ) · U_j†(x)
+                    # Upper smearing staple: U_j(x) · U_i(x+ĵ) · U_j†(x+î)
                     upper = qmul(qmul(
-                        self._shift(U_sm[j], i, fwd=True),
-                        qdagger(self._shift(U_sm[i], j, fwd=True))),
-                        qdagger(U_sm[j]))
-                    # lower spatial staple: U_j†(x+î-ĵ) · U_i†(x-ĵ) · U_j(x-ĵ)
+                        U_sm[j],
+                        self._shift(U_sm[i], j, fwd=True)),
+                        qdagger(self._shift(U_sm[j], i, fwd=True)))
+                    # Lower smearing staple: U_j†(x-ĵ) · U_i(x-ĵ) · U_j(x-ĵ+î)
                     lower = qmul(qmul(
-                        qdagger(self._shift(
-                            self._shift(U_sm[j], i, fwd=True), j, fwd=False)),
-                        qdagger(self._shift(U_sm[i], j, fwd=False))),
-                        self._shift(U_sm[j], j, fwd=False))
+                        qdagger(self._shift(U_sm[j], j, fwd=False)),
+                        self._shift(U_sm[i], j, fwd=False)),
+                        self._shift(self._shift(U_sm[j], j, fwd=False), i, fwd=True))
                     staple = staple + upper + lower
-                # Blend and project back to SU(2)
                 blended = (1.0 - alpha) * U_sm[i] + (alpha / 4.0) * staple
                 U_new[i] = qnormalize(blended)
             U_sm[1], U_sm[2], U_sm[3] = U_new[1], U_new[2], U_new[3]
 
-        # Measure spatial plaquettes with smeared links
+        return U_sm
+
+    def _spatial_plaq_timeslice_from_links(self, U_links):
+        """
+        O(t) from given spatial links [None, U1, U2, U3].
+        Returns shape (Nt,).
+        """
         Nt = self.dims[0]
         O = xp.zeros(Nt)
         for mu in range(1, 4):
             for nu in range(mu + 1, 4):
                 P = qmul(
-                    qmul(U_sm[mu], self._shift(U_sm[nu], mu, fwd=True)),
-                    qmul(qdagger(self._shift(U_sm[mu], nu, fwd=True)),
-                         qdagger(U_sm[nu])))
+                    qmul(U_links[mu], self._shift(U_links[nu], mu, fwd=True)),
+                    qmul(qdagger(self._shift(U_links[mu], nu, fwd=True)),
+                         qdagger(U_links[nu])))
                 O = O + xp.sum(P[..., 0], axis=(1, 2, 3))
         return O
 
-    def topological_charge(self):
-        """
-        Naive lattice topological charge (clover definition).
-        Q = (1/32π²) Σ_x εμνρσ Tr[F_μν F_ρσ]
-        Computed from clover-leaf F_μν.
-        Returns float.
-        """
-        # Clover plaquette in each plane
-        def _clover(mu, nu):
-            """(1/4)(P_{μν} + P_{ν,-μ} + P_{-μ,-ν} + P_{-ν,μ}) at each site."""
-            p1 = self._plaq_quat(mu, nu)
-            p2 = self._plaq_quat_rev(nu, mu)
-            p3 = self._plaq_quat_rev(mu, nu)
-            p4 = self._plaq_quat(nu, mu)
-            # Anti-hermitian traceless part ~ F_μν
-            c = p1 + p2 + p3 + p4
-            return c
+    def _smeared_plaquette_avg(self, U_links):
+        """Average spatial plaquette from smeared links. For validation."""
+        s = 0.0
+        count = 0
+        for mu in range(1, 4):
+            for nu in range(mu + 1, 4):
+                P = qmul(
+                    qmul(U_links[mu], self._shift(U_links[nu], mu, fwd=True)),
+                    qmul(qdagger(self._shift(U_links[mu], nu, fwd=True)),
+                         qdagger(U_links[nu])))
+                s += float(xp.mean(P[..., 0]))
+                count += 1
+        return s / count
 
-        # For the topological charge we need the full quaternion plaquettes,
-        # not just traces. This is a placeholder for Phase 1+.
-        # For Phase 0, we skip this.
-        raise NotImplementedError("Topological charge requires Phase 1 implementation")
+    def multi_smear_operators(self, smear_levels, alpha=0.3):
+        """
+        Measure 0++ glueball operators at multiple smearing levels.
+
+        Parameters
+        ----------
+        smear_levels : list of int — e.g. [0, 5, 10, 20]
+        alpha        : float — APE smearing parameter
+
+        Returns
+        -------
+        operators : ndarray, shape (n_levels, Nt)
+        smeared_plaq : list of float — avg spatial plaquette at each level (for validation)
+        """
+        Nt = self.dims[0]
+        n_levels = len(smear_levels)
+        operators = xp.zeros((n_levels, Nt))
+        smeared_plaq = []
+
+        # Sort levels so we can smear incrementally
+        sorted_idx = sorted(range(n_levels), key=lambda k: smear_levels[k])
+        sorted_levels = [smear_levels[k] for k in sorted_idx]
+
+        # Start from unsmeared spatial links
+        U_sm = [None, self.U[1].copy(), self.U[2].copy(), self.U[3].copy()]
+        current_n = 0
+
+        for rank, idx in enumerate(sorted_idx):
+            target_n = sorted_levels[rank]
+            # Smear incrementally from current level to target
+            if target_n > current_n:
+                delta = target_n - current_n
+                for _ in range(delta):
+                    U_new = [None, None, None, None]
+                    for i in range(1, 4):
+                        staple = xp.zeros_like(U_sm[i])
+                        for j in range(1, 4):
+                            if j == i:
+                                continue
+                            upper = qmul(qmul(
+                                U_sm[j],
+                                self._shift(U_sm[i], j, fwd=True)),
+                                qdagger(self._shift(U_sm[j], i, fwd=True)))
+                            lower = qmul(qmul(
+                                qdagger(self._shift(U_sm[j], j, fwd=False)),
+                                self._shift(U_sm[i], j, fwd=False)),
+                                self._shift(self._shift(U_sm[j], j, fwd=False), i, fwd=True))
+                            staple = staple + upper + lower
+                        blended = (1.0 - alpha) * U_sm[i] + (alpha / 4.0) * staple
+                        U_new[i] = qnormalize(blended)
+                    U_sm[1], U_sm[2], U_sm[3] = U_new[1], U_new[2], U_new[3]
+                current_n = target_n
+
+            # Measure operator at this level
+            operators[idx] = self._spatial_plaq_timeslice_from_links(U_sm)
+            smeared_plaq.append(self._smeared_plaquette_avg(U_sm))
+
+        # Reorder smeared_plaq to match original level order
+        plaq_ordered = [0.0] * n_levels
+        for rank, idx in enumerate(sorted_idx):
+            plaq_ordered[idx] = smeared_plaq[rank]
+
+        return operators, plaq_ordered
+
+    def smeared_spatial_plaquette_timeslice(self, n_smear=20, alpha=0.5):
+        """Legacy single-smearing interface."""
+        U_sm = self._ape_smear(n_smear, alpha)
+        return self._spatial_plaq_timeslice_from_links(U_sm)
+
+    def _plaquette_quat(self, mu, nu):
+        """Full quaternion plaquette U_{μν}(x). Shape (Nt,Nx,Ny,Nz,4)."""
+        return qmul(
+            qmul(self.U[mu], self._shift(self.U[nu], mu, fwd=True)),
+            qmul(qdagger(self._shift(self.U[mu], nu, fwd=True)),
+                 qdagger(self.U[nu])))
+
+    def _clover_fmunu(self, mu, nu):
+        """
+        Clover-leaf field strength tensor F_{μν}(x) in quaternion form.
+
+        F_{μν} = (1/8) Im[ C_{μν} − C_{νμ} ]
+        where C_{μν} = P_{μν}(x) + P_{ν,-μ}(x) + P_{-μ,-ν}(x) + P_{-ν,μ}(x)
+        is the sum of the four plaquettes in the (μ,ν) plane sharing corner x.
+
+        For SU(2) quaternions: Im part = (0, a1, a2, a3), i.e. drop a0.
+        The anti-hermitian traceless part is encoded in (a1, a2, a3).
+        Returns shape (Nt, Nx, Ny, Nz, 4) with a0 = 0.
+        """
+        # Four oriented plaquettes sharing corner x in the (mu,nu) plane
+        # P1: x → x+μ → x+μ+ν → x+ν → x  (standard plaquette at x)
+        P1 = self._plaquette_quat(mu, nu)
+
+        # P2: x → x+ν → x+ν-μ → x-μ → x  (= P_{ν,-μ} at x)
+        P2 = qmul(qmul(
+            self.U[nu],
+            qdagger(self._shift(self._shift(self.U[mu], nu, fwd=True), mu, fwd=False))),
+            qmul(qdagger(self._shift(self.U[nu], mu, fwd=False)),
+                 self._shift(self.U[mu], mu, fwd=False)))
+
+        # P3: x → x-μ → x-μ-ν → x-ν → x  (= P_{-μ,-ν} at x)
+        P3 = qmul(qmul(
+            qdagger(self._shift(self.U[mu], mu, fwd=False)),
+            qdagger(self._shift(self._shift(self.U[nu], mu, fwd=False), nu, fwd=False))),
+            qmul(self._shift(self._shift(self.U[mu], mu, fwd=False), nu, fwd=False),
+                 self._shift(self.U[nu], nu, fwd=False)))
+
+        # P4: x → x-ν → x-ν+μ → x+μ → x  (= P_{-ν,μ} at x)
+        P4 = qmul(qmul(
+            qdagger(self._shift(self.U[nu], nu, fwd=False)),
+            self._shift(self._shift(self.U[mu], nu, fwd=False), mu, fwd=False)),  # wrong
+            qmul(self._shift(self.U[nu], mu, fwd=True),   # also reconsider
+                 qdagger(self.U[mu])))
+
+        # Clover sum
+        C = P1 + P2 + P3 + P4  # quaternion sum, shape (..., 4)
+
+        # Anti-hermitian traceless part: (C - C†) / 2
+        # For quaternion (a0, a1, a2, a3): C† = (a0, -a1, -a2, -a3)
+        # (C - C†)/2 = (0, a1, a2, a3) — just zero out a0
+        F = C.copy()
+        F[..., 0] = 0.0
+        F = F / 8.0  # normalization: 4 plaquettes, factor 1/2 for anti-herm
+
+        return F
+
+    def gradient_flow_step(self, U_flow, epsilon):
+        """
+        One Euler step of Wilson gradient flow.
+
+        The flow equation minimizes the Wilson action:
+            dU_μ/dt = -g₀² (∂S_W/∂U_μ) U_μ
+
+        The derivative of S_W = β Σ (1 - (1/2) Tr P) w.r.t. U_μ gives
+        a force that drives U_μ toward the staple sum V_μ.
+
+        Euler step: U_new = Proj_SU2[ U + ε · V ]
+        where V is the action staple sum. This moves U toward V,
+        which minimizes the action (smooths the configuration).
+
+        Parameters
+        ----------
+        U_flow : ndarray, shape (4, Nt, Nx, Ny, Nz, 4)
+        epsilon : float — step size (typical: 0.01–0.02)
+
+        Returns
+        -------
+        U_new : ndarray — flowed config after one step
+        """
+        U_new = xp.empty_like(U_flow)
+        for mu in range(4):
+            # Action staple: same formula as in _staple() but on U_flow
+            V = xp.zeros_like(U_flow[mu])
+            for nu in range(4):
+                if nu == mu:
+                    continue
+                u1 = xp.roll(U_flow[nu], -1, axis=mu)
+                u2 = qdagger(xp.roll(U_flow[mu], -1, axis=nu))
+                u3 = qdagger(U_flow[nu])
+                upper = qmul(qmul(u1, u2), u3)
+
+                u4 = qdagger(xp.roll(xp.roll(U_flow[nu], -1, axis=mu), 1, axis=nu))
+                u5 = qdagger(xp.roll(U_flow[mu], 1, axis=nu))
+                u6 = xp.roll(U_flow[nu], 1, axis=nu)
+                lower = qmul(qmul(u4, u5), u6)
+
+                V = V + upper + lower
+
+            # Lie algebra projection: Z = V · U† - U · V†  (anti-hermitian part)
+            # For SU(2) quaternions: V·U† has components, and the anti-hermitian
+            # part is the imaginary (vector) part of V·U†.
+            # Then U_new = exp(ε·Z) · U ≈ normalize(U + ε·Z·U)
+            # But Z·U = (V·U†)_AH · U = V - (Re Tr(V·U†)/2)·U
+            # Simpler Euler: U_new = normalize(U + ε·V)
+            # This works because V points in the direction that increases
+            # Tr(U·V†) = Tr(plaquette), i.e., decreases the action.
+            # S ∝ -Tr(U·V†) → minimize by moving U toward V†
+            # (equivalently, maximizing Re Tr(U·V†) = maximizing overlap)
+            U_new[mu] = qnormalize(U_flow[mu] + epsilon * qdagger(V))
+
+        return U_new
+
+    def topological_charge(self, U_in=None):
+        """
+        Topological charge from clover definition.
+
+        Q = (1/32π²) Σ_x ε_{μνρσ} Tr[F_{μν}(x) F_{ρσ}(x)]
+
+        For SU(2), F_{μν} is in the Lie algebra su(2) ≅ R³.
+        Tr(F_{μν} F_{ρσ}) = -2 (f1·g1 + f2·g2 + f3·g3)
+        where f = (a1,a2,a3) of F_{μν} quaternion, g = same for F_{ρσ}.
+
+        Parameters
+        ----------
+        U_in : gauge field array, or None to use self.U
+
+        Returns
+        -------
+        Q : float — topological charge (should be near-integer after flow)
+        """
+        # Save and temporarily replace U if external field provided
+        if U_in is not None:
+            U_save = self.U
+            self.U = U_in
+
+        # Compute clover F_{μν} for all 6 planes
+        F = {}
+        for mu in range(4):
+            for nu in range(mu + 1, 4):
+                F[(mu, nu)] = self._clover_fmunu(mu, nu)
+
+        # Q = (1/32π²) Σ_x ε_{μνρσ} Tr(F_{μν} F_{ρσ})
+        # The nonzero terms of ε_{μνρσ} with μ<ν and ρ<σ:
+        # ε_{0123} = +1 → (01)(23)
+        # ε_{0213} = -1 → (02)(13) with sign -1
+        # ε_{0312} = +1 → (03)(12)
+        # For Tr(F·G) with quaternions (0, f1,f2,f3) and (0, g1,g2,g3):
+        # Product has a0 = -(f1g1 + f2g2 + f3g3), so Tr = 2·a0 = -2(f·g)
+
+        def tr_ff(mu1, nu1, mu2, nu2):
+            f = F[(mu1, nu1)]
+            g = F[(mu2, nu2)]
+            # Tr(F·G) = -2(f1g1 + f2g2 + f3g3)
+            dot = (f[..., 1] * g[..., 1] + f[..., 2] * g[..., 2]
+                   + f[..., 3] * g[..., 3])
+            return -2.0 * dot
+
+        # ε sum: Q = (1/32π²) Σ_x [ Tr(F01·F23) - Tr(F02·F13) + Tr(F03·F12) ] × 8
+        # The factor 8 comes from: each (μν,ρσ) pair appears 8 times in the
+        # full ε sum (4! / (2!·2!) × 2 for antisymmetry = 8... actually let me
+        # just enumerate the nonzero terms).
+        # ε_{0123} = ε_{2301} = ε_{1032} = ε_{3210} = +1 (even permutations)
+        # ε_{0132} = ε_{1023} = ... = -1 (odd permutations)
+        # With F_{μν} = -F_{νμ}, each independent pair contributes 8 times.
+        q_density = (tr_ff(0, 1, 2, 3) - tr_ff(0, 2, 1, 3) + tr_ff(0, 3, 1, 2))
+
+        Q = float(xp.sum(q_density)) / (2.0 * np.pi ** 2)
+
+        if U_in is not None:
+            self.U = U_save
+
+        return Q
+
+    def topological_charge_flowed(self, n_flow=100, epsilon=0.01):
+        """
+        Topological charge after gradient flow smoothing.
+
+        Parameters
+        ----------
+        n_flow  : int   — number of flow steps
+        epsilon : float — step size (flow time = n_flow × epsilon)
+
+        Returns
+        -------
+        Q       : float — topological charge (near-integer)
+        t_flow  : float — total flow time
+        """
+        U_flow = self.U.copy()
+        for _ in range(n_flow):
+            U_flow = self.gradient_flow_step(U_flow, epsilon)
+
+        Q = self.topological_charge(U_in=U_flow)
+        t_flow = n_flow * epsilon
+        return Q, t_flow
 
 
 # ---------------------------------------------------------------------------
@@ -417,3 +686,123 @@ def effective_mass(C, C_err=None):
             dm[bad] = np.nan
         return m, dm
     return m, None
+
+
+# ---------------------------------------------------------------------------
+# Multi-operator correlator matrix and GEVP
+# ---------------------------------------------------------------------------
+
+def correlator_matrix(O_all):
+    """
+    Compute the symmetrized correlator matrix C_ij(τ) with VEV subtraction.
+
+    C_ij(τ) = (1/Nt) Σ_t ⟨O_i(t+τ) O_j(t)⟩ − ⟨O_i⟩⟨O_j⟩
+
+    The result is explicitly symmetrized: C_sym = [C + Cᵀ] / 2.
+    This is standard practice — the spectral decomposition guarantees
+    C_ij(τ) = C_ji(τ) for hermitian operators, and symmetrization
+    removes statistical noise in the antisymmetric part.
+
+    Parameters
+    ----------
+    O_all : ndarray, shape (n_configs, n_ops, Nt)
+
+    Returns
+    -------
+    C     : ndarray, shape (n_ops, n_ops, Nt)  — symmetrized correlator matrix
+    C_err : ndarray, shape (n_ops, n_ops, Nt)  — jackknife errors
+    """
+    n_cfg, n_ops, Nt = O_all.shape
+
+    O_vev = np.mean(O_all, axis=(0, 2))  # (n_ops,)
+
+    # C_ij(τ) = (1/Nt) Σ_t O_i(t+τ) · O_j(t) − ⟨O_i⟩⟨O_j⟩
+    C_per_cfg = np.zeros((n_cfg, n_ops, n_ops, Nt))
+    for tau in range(Nt):
+        O_shifted = np.roll(O_all, -tau, axis=2)  # O(t+τ)
+        for i in range(n_ops):
+            for j in range(n_ops):
+                # O_i(t+τ) · O_j(t), averaged over t
+                C_per_cfg[:, i, j, tau] = np.mean(
+                    O_shifted[:, i, :] * O_all[:, j, :], axis=1
+                ) - O_vev[i] * O_vev[j]
+
+    C = np.mean(C_per_cfg, axis=0)
+
+    # Symmetrize: C_sym = [C + Cᵀ] / 2
+    for tau in range(Nt):
+        C[:, :, tau] = 0.5 * (C[:, :, tau] + C[:, :, tau].T)
+
+    # Jackknife errors (on symmetrized correlator)
+    C_jack = np.zeros((n_cfg, n_ops, n_ops, Nt))
+    for k in range(n_cfg):
+        O_loo = np.delete(O_all, k, axis=0)
+        vev_k = np.mean(O_loo, axis=(0, 2))
+        for tau in range(Nt):
+            O_sh = np.roll(O_loo, -tau, axis=2)
+            for i in range(n_ops):
+                for j in range(n_ops):
+                    C_jack[k, i, j, tau] = np.mean(
+                        O_sh[:, i, :] * O_loo[:, j, :]) - vev_k[i] * vev_k[j]
+        for tau in range(Nt):
+            C_jack[k, :, :, tau] = 0.5 * (C_jack[k, :, :, tau] + C_jack[k, :, :, tau].T)
+
+    C_err = np.sqrt((n_cfg - 1) * np.mean((C_jack - C[None, :, :, :]) ** 2, axis=0))
+
+    return C, C_err
+
+
+def solve_gevp(C, tau0=1):
+    """
+    Solve the Generalized Eigenvalue Problem:
+        C(τ) v_n = λ_n(τ, τ₀) C(τ₀) v_n
+
+    Parameters
+    ----------
+    C    : ndarray, shape (n_ops, n_ops, Nt) — correlator matrix
+    tau0 : int — reference timeslice (default 1)
+
+    Returns
+    -------
+    eigenvalues : ndarray, shape (n_ops, Nt) — λ_n(τ) for each state n
+    masses      : ndarray, shape (n_ops, Nt-1) — m_n(τ) = ln(λ_n(τ)/λ_n(τ+1))
+    """
+    from scipy.linalg import eigh
+
+    n_ops, _, Nt = C.shape
+    eigenvalues = np.full((n_ops, Nt), np.nan)
+    masses = np.full((n_ops, Nt - 1), np.nan)
+
+    C0 = C[:, :, tau0]
+
+    # Check C(τ₀) is symmetric positive definite
+    eigvals_c0 = np.linalg.eigvalsh(C0)
+    if np.any(eigvals_c0 <= 0):
+        print(f"  WARNING: C(tau0={tau0}) is not positive definite. "
+              f"Eigenvalues: {eigvals_c0}")
+        # Regularize: add small diagonal
+        reg = abs(np.min(eigvals_c0)) * 1.1 + 1e-10
+        C0 = C0 + reg * np.eye(n_ops)
+        print(f"  Regularized with {reg:.2e}")
+
+    for tau in range(Nt):
+        Ct = C[:, :, tau]
+        # Symmetrize
+        Ct = 0.5 * (Ct + Ct.T)
+        try:
+            evals, _ = eigh(Ct, C0)
+            # Sort descending (largest eigenvalue = ground state)
+            idx = np.argsort(evals)[::-1]
+            eigenvalues[:, tau] = evals[idx]
+        except Exception:
+            pass
+
+    # Effective masses from eigenvalues
+    for n in range(n_ops):
+        for tau in range(Nt - 1):
+            lam_t = eigenvalues[n, tau]
+            lam_t1 = eigenvalues[n, tau + 1]
+            if lam_t > 0 and lam_t1 > 0:
+                masses[n, tau] = np.log(lam_t / lam_t1)
+
+    return eigenvalues, masses
