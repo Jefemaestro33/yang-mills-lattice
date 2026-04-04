@@ -465,21 +465,23 @@ class GaugeField:
                  self._shift(self.U[nu], nu, fwd=False)))
 
         # P4: x → x-ν → x-ν+μ → x+μ → x  (= P_{-ν,μ} at x)
+        # Links: U_ν†(x-ν̂) · U_μ(x-ν̂) · U_ν(x-ν̂+μ̂) · U_μ†(x)
         P4 = qmul(qmul(
-            qdagger(self._shift(self.U[nu], nu, fwd=False)),
-            self._shift(self._shift(self.U[mu], nu, fwd=False), mu, fwd=False)),  # wrong
-            qmul(self._shift(self.U[nu], mu, fwd=True),   # also reconsider
+            qdagger(self._shift(self.U[nu], nu, fwd=False)),          # U_ν†(x-ν̂)
+            self._shift(self.U[mu], nu, fwd=False)),                  # U_μ(x-ν̂)
+            qmul(self._shift(self._shift(self.U[nu], nu, fwd=False), mu, fwd=True),  # U_ν(x-ν̂+μ̂)
                  qdagger(self.U[mu])))
 
         # Clover sum
         C = P1 + P2 + P3 + P4  # quaternion sum, shape (..., 4)
 
-        # Anti-hermitian traceless part: (C - C†) / 2
-        # For quaternion (a0, a1, a2, a3): C† = (a0, -a1, -a2, -a3)
-        # (C - C†)/2 = (0, a1, a2, a3) — just zero out a0
+        # Clover field strength: F̂ = Im(C) / 4
+        # C = sum of 4 plaquettes, each ≈ 1 + a²F_cont in continuum.
+        # Im(C) = (0, c1, c2, c3), matrix form = i·c⃗·σ⃗ ≈ 4a²·F_cont
+        # Dividing by 4: F̂ ≈ a²·F_cont (correct continuum limit)
         F = C.copy()
         F[..., 0] = 0.0
-        F = F / 8.0  # normalization: 4 plaquettes, factor 1/2 for anti-herm
+        F = F / 4.0
 
         return F
 
@@ -525,16 +527,8 @@ class GaugeField:
 
                 V = V + upper + lower
 
-            # Lie algebra projection: Z = V · U† - U · V†  (anti-hermitian part)
-            # For SU(2) quaternions: V·U† has components, and the anti-hermitian
-            # part is the imaginary (vector) part of V·U†.
-            # Then U_new = exp(ε·Z) · U ≈ normalize(U + ε·Z·U)
-            # But Z·U = (V·U†)_AH · U = V - (Re Tr(V·U†)/2)·U
-            # Simpler Euler: U_new = normalize(U + ε·V)
-            # This works because V points in the direction that increases
-            # Tr(U·V†) = Tr(plaquette), i.e., decreases the action.
-            # S ∝ -Tr(U·V†) → minimize by moving U toward V†
-            # (equivalently, maximizing Re Tr(U·V†) = maximizing overlap)
+            # Move U toward V†/|V| (direction that minimizes action).
+            # Simple projected Euler: U_new = Proj_SU2(U + ε·V†)
             U_new[mu] = qnormalize(U_flow[mu] + epsilon * qdagger(V))
 
         return U_new
@@ -576,24 +570,23 @@ class GaugeField:
         # For Tr(F·G) with quaternions (0, f1,f2,f3) and (0, g1,g2,g3):
         # Product has a0 = -(f1g1 + f2g2 + f3g3), so Tr = 2·a0 = -2(f·g)
 
-        def tr_ff(mu1, nu1, mu2, nu2):
+        def tr_cc(mu1, nu1, mu2, nu2):
             f = F[(mu1, nu1)]
             g = F[(mu2, nu2)]
-            # Tr(F·G) = -2(f1g1 + f2g2 + f3g3)
             dot = (f[..., 1] * g[..., 1] + f[..., 2] * g[..., 2]
                    + f[..., 3] * g[..., 3])
             return -2.0 * dot
 
-        # ε sum: Q = (1/32π²) Σ_x [ Tr(F01·F23) - Tr(F02·F13) + Tr(F03·F12) ] × 8
-        # The factor 8 comes from: each (μν,ρσ) pair appears 8 times in the
-        # full ε sum (4! / (2!·2!) × 2 for antisymmetry = 8... actually let me
-        # just enumerate the nonzero terms).
-        # ε_{0123} = ε_{2301} = ε_{1032} = ε_{3210} = +1 (even permutations)
-        # ε_{0132} = ε_{1023} = ... = -1 (odd permutations)
-        # With F_{μν} = -F_{νμ}, each independent pair contributes 8 times.
-        q_density = (tr_ff(0, 1, 2, 3) - tr_ff(0, 2, 1, 3) + tr_ff(0, 3, 1, 2))
+        # Full ε sum: Σ_{μνρσ} ε_{μνρσ} Tr(F_μν F_ρσ)
+        # With F_{μν} = -F_{νμ}, the 3 independent pairs (μ<ν, ρ<��) each
+        # appear 8 times in the 24-term sum:
+        #   (01,23) with sign +1, (02,13) with sign -1, (03,12) with sign +1
+        # So: Σ ε Tr(FF) = 8 × [Tr(F01·F23) - Tr(F02·F13) + Tr(F03·F12)]
+        # And: Q = (1/32π²) × 8 × [...] = (1/4π²) × [...]
+        q_density = (tr_cc(0, 1, 2, 3) - tr_cc(0, 2, 1, 3) + tr_cc(0, 3, 1, 2))
 
-        Q = float(xp.sum(q_density)) / (2.0 * np.pi ** 2)
+        # Q = (1/32π²) × Σ ε Tr(F̂·F̂) = (8/32π²) × Σ_x q_density = (1/4π²) × Σ_x q_density
+        Q = float(xp.sum(q_density)) / (4.0 * np.pi ** 2)
 
         if U_in is not None:
             self.U = U_save
