@@ -1,4 +1,7 @@
-results/
+results/*.png
+results/test_*
+results/checkpoint_*
+results/validation_*
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
