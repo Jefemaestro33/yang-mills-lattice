@@ -615,6 +615,193 @@ class GaugeField:
         t_flow = n_flow * epsilon
         return Q, t_flow
 
+    def topological_charge_density(self, U_in=None):
+        """
+        Topological charge density q(x) at each lattice site.
+
+        q(x) = [Tr(F01·F23) - Tr(F02·F13) + Tr(F03·F12)] / (4π²)
+
+        Parameters
+        ----------
+        U_in : gauge field array, or None to use self.U
+
+        Returns
+        -------
+        q : ndarray, shape (Nt, Nx, Ny, Nz) — charge density per site
+        """
+        if U_in is not None:
+            U_save = self.U
+            self.U = U_in
+
+        F = {}
+        for mu in range(4):
+            for nu in range(mu + 1, 4):
+                F[(mu, nu)] = self._clover_fmunu(mu, nu)
+
+        def tr_cc(mu1, nu1, mu2, nu2):
+            f = F[(mu1, nu1)]
+            g = F[(mu2, nu2)]
+            dot = (f[..., 1] * g[..., 1] + f[..., 2] * g[..., 2]
+                   + f[..., 3] * g[..., 3])
+            return -2.0 * dot
+
+        q = (tr_cc(0, 1, 2, 3) - tr_cc(0, 2, 1, 3) + tr_cc(0, 3, 1, 2))
+        q = q / (4.0 * np.pi ** 2)
+
+        if U_in is not None:
+            self.U = U_save
+
+        return q
+
+    def topological_charge_timeslice(self, U_in=None):
+        """
+        Q_slice(t) = Σ_{x⃗} q(x⃗, t) — topological charge per time-slice.
+
+        Returns shape (Nt,).
+        """
+        q = self.topological_charge_density(U_in=U_in)
+        return xp.sum(q, axis=(1, 2, 3))
+
+    def multi_flow_measurements(self, flow_times=(0.5, 1.0, 2.0), epsilon=0.01):
+        """
+        Gradient flow to multiple flow times, measuring Q and Q_slice at each.
+
+        Flows incrementally: t=0 → t₁ → t₂ → t₃ to avoid redundant work.
+
+        Parameters
+        ----------
+        flow_times : tuple of float — flow times to measure at (must be sorted)
+        epsilon    : float — flow step size
+
+        Returns
+        -------
+        results : dict with keys:
+            'Q'       : list of float — global Q at each flow time
+            'Q_slice' : list of ndarray (Nt,) — Q_slice(t) at each flow time
+            'flow_times' : list of float — actual flow times
+        """
+        flow_times = sorted(flow_times)
+        U_flow = self.U.copy()
+        current_t = 0.0
+
+        Q_list = []
+        Q_slice_list = []
+        t_list = []
+
+        for target_t in flow_times:
+            # Flow from current_t to target_t
+            n_steps = int(round((target_t - current_t) / epsilon))
+            for _ in range(n_steps):
+                U_flow = self.gradient_flow_step(U_flow, epsilon)
+            current_t += n_steps * epsilon
+
+            # Measure
+            Q_slice = self.topological_charge_timeslice(U_in=U_flow)
+            Q = float(xp.sum(Q_slice))
+
+            if hasattr(Q_slice, 'get'):
+                Q_slice = Q_slice.get()
+
+            Q_list.append(Q)
+            Q_slice_list.append(Q_slice)
+            t_list.append(current_t)
+
+        return {
+            'Q': Q_list,
+            'Q_slice': Q_slice_list,
+            'flow_times': t_list,
+        }
+
+    def pseudoscalar_clover_timeslice(self, U_spatial=None):
+        """
+        Pseudoscalar (0⁻) operator from clover q(x) using given spatial links.
+
+        Uses the clover field strength with the provided spatial links
+        (possibly APE-smeared) and the original temporal links.
+        The topological charge density q(x) ∝ ε_{μνρσ} Tr(F_μν F_ρσ)
+        is a pseudoscalar under spatial parity.
+
+        Parameters
+        ----------
+        U_spatial : list [None, U1, U2, U3] of smeared spatial links,
+                    or None to use self.U[1:4]
+
+        Returns
+        -------
+        O : ndarray, shape (Nt,) — pseudoscalar operator per time-slice
+        """
+        # Temporarily replace spatial links with smeared ones
+        if U_spatial is not None:
+            U_save = [None, self.U[1].copy(), self.U[2].copy(), self.U[3].copy()]
+            for i in range(1, 4):
+                if U_spatial[i] is not None:
+                    self.U[i] = U_spatial[i]
+
+        # Compute q(x) and sum over spatial sites
+        O = self.topological_charge_timeslice()
+
+        # Restore original links
+        if U_spatial is not None:
+            for i in range(1, 4):
+                self.U[i] = U_save[i]
+
+        return O
+
+    def multi_smear_pseudoscalar(self, smear_levels, alpha=0.3):
+        """
+        Pseudoscalar 0⁻ operators at multiple APE smearing levels.
+
+        Uses the clover topological charge density with APE-smeared spatial
+        links + original temporal links.
+
+        Parameters
+        ----------
+        smear_levels : list of int — e.g. [0, 5, 10, 20]
+        alpha        : float — APE smearing parameter
+
+        Returns
+        -------
+        operators : ndarray, shape (n_levels, Nt)
+        """
+        Nt = self.dims[0]
+        n_levels = len(smear_levels)
+        operators = xp.zeros((n_levels, Nt))
+
+        sorted_idx = sorted(range(n_levels), key=lambda k: smear_levels[k])
+        sorted_levels = [smear_levels[k] for k in sorted_idx]
+
+        U_sm = [None, self.U[1].copy(), self.U[2].copy(), self.U[3].copy()]
+        current_n = 0
+
+        for rank, idx in enumerate(sorted_idx):
+            target_n = sorted_levels[rank]
+            if target_n > current_n:
+                delta = target_n - current_n
+                for _ in range(delta):
+                    U_new = [None, None, None, None]
+                    for i in range(1, 4):
+                        staple = xp.zeros_like(U_sm[i])
+                        for j in range(1, 4):
+                            if j == i:
+                                continue
+                            upper = qmul(qmul(
+                                U_sm[j],
+                                self._shift(U_sm[i], j, fwd=True)),
+                                qdagger(self._shift(U_sm[j], i, fwd=True)))
+                            lower = qmul(qmul(
+                                qdagger(self._shift(U_sm[j], j, fwd=False)),
+                                self._shift(U_sm[i], j, fwd=False)),
+                                self._shift(self._shift(U_sm[j], j, fwd=False), i, fwd=True))
+                            staple = staple + upper + lower
+                        blended = (1.0 - alpha) * U_sm[i] + (alpha / 4.0) * staple
+                        U_new[i] = qnormalize(blended)
+                    U_sm[1], U_sm[2], U_sm[3] = U_new[1], U_new[2], U_new[3]
+                current_n = target_n
+
+            operators[idx] = self.pseudoscalar_clover_timeslice(U_spatial=U_sm)
+
+        return operators
+
 
 # ---------------------------------------------------------------------------
 # Correlator analysis
